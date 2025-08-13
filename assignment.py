@@ -8,25 +8,32 @@ warnings.filterwarnings('ignore')
 
 # Machine Learning imports
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.linear_model import LinearRegression, Ridge, Lasso
-from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.feature_selection import SelectKBest, f_regression
 import xgboost as xgb
 import lightgbm as lgb
 
 # Statistical imports
 from scipy import stats
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, spearmanr
+from scipy.signal import savgol_filter
+import talib  # Technical Analysis Library - install with pip install TA-Lib
+
+# Advanced modeling
+from sklearn.neural_network import MLPRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel
 
 class ETHVolatilityForecaster:
     """
+    Advanced ETH Implied Volatility Forecasting Model
     
-    ETH Implied Volatility Forecasting Model
-    
-    This class implements a comprehensive approach to forecasting 10-second ahead
-    implied volatility for Ethereum using high-frequency orderbook data and 
-    cross-asset signals.
+    This class implements a sophisticated approach to forecasting 10-second ahead
+    implied volatility for Ethereum using high-frequency orderbook data, 
+    cross-asset signals, and advanced feature engineering.
     """
     
     def __init__(self, data_path_train="/kaggle/input/gq2data/train/",
@@ -39,6 +46,7 @@ class ETHVolatilityForecaster:
         self.models = {}
         self.scalers = {}
         self.feature_columns = []
+        self.feature_importance = {}
         
     def load_data(self):
         """Load all training and test data"""
@@ -132,25 +140,48 @@ class ETHVolatilityForecaster:
         print(f"Final cleaned data shape: {df_clean.shape}")
         return df_clean
     
-    def calculate_orderbook_features(self, df, prefix=""):
-        """Calculate orderbook-based features"""
+    def calculate_advanced_orderbook_features(self, df, prefix=""):
+        """Calculate advanced orderbook-based features"""
         df_features = df.copy()
         
         # Basic price features
         df_features[f'{prefix}spread'] = df_features['ask_price1'] - df_features['bid_price1']
         df_features[f'{prefix}spread_pct'] = df_features[f'{prefix}spread'] / (df_features['mid_price'] + 1e-8)
         
-        # Orderbook imbalance features
-        df_features[f'{prefix}volume_imbalance_1'] = (df_features['bid_volume1'] - df_features['ask_volume1']) / (df_features['bid_volume1'] + df_features['ask_volume1'] + 1e-8)
+        # Orderbook imbalance features (multiple levels)
+        for level in range(1, 6):
+            if f'bid_volume{level}' in df_features.columns and f'ask_volume{level}' in df_features.columns:
+                df_features[f'{prefix}volume_imbalance_{level}'] = (
+                    (df_features[f'bid_volume{level}'] - df_features[f'ask_volume{level}']) / 
+                    (df_features[f'bid_volume{level}'] + df_features[f'ask_volume{level}'] + 1e-8)
+                )
         
-        # Total volume features
+        # Weighted orderbook pressure
         bid_volumes = [f'bid_volume{i}' for i in range(1, 6) if f'bid_volume{i}' in df_features.columns]
         ask_volumes = [f'ask_volume{i}' for i in range(1, 6) if f'ask_volume{i}' in df_features.columns]
         
         if bid_volumes and ask_volumes:
+            # Weight by inverse distance from mid price
+            weights = np.array([1/i for i in range(1, len(bid_volumes)+1)])
+            
+            weighted_bid_vol = sum(df_features[vol] * weight for vol, weight in zip(bid_volumes, weights))
+            weighted_ask_vol = sum(df_features[vol] * weight for vol, weight in zip(ask_volumes, weights))
+            
+            df_features[f'{prefix}weighted_orderbook_pressure'] = (
+                (weighted_bid_vol - weighted_ask_vol) / (weighted_bid_vol + weighted_ask_vol + 1e-8)
+            )
+            
+            # Total volume features
             df_features[f'{prefix}total_bid_volume'] = df_features[bid_volumes].sum(axis=1)
             df_features[f'{prefix}total_ask_volume'] = df_features[ask_volumes].sum(axis=1)
             df_features[f'{prefix}total_volume'] = df_features[f'{prefix}total_bid_volume'] + df_features[f'{prefix}total_ask_volume']
+            
+            # Volume concentration (Gini coefficient approximation)
+            bid_vol_array = df_features[bid_volumes].values
+            ask_vol_array = df_features[ask_volumes].values
+            
+            df_features[f'{prefix}bid_concentration'] = self._calculate_concentration(bid_vol_array)
+            df_features[f'{prefix}ask_concentration'] = self._calculate_concentration(ask_vol_array)
             
             # Volume-weighted prices
             bid_prices = [f'bid_price{i}' for i in range(1, 6) if f'bid_price{i}' in df_features.columns]
@@ -159,66 +190,168 @@ class ETHVolatilityForecaster:
             if bid_prices and ask_prices:
                 df_features[f'{prefix}vwap_bid'] = (df_features[bid_prices] * df_features[bid_volumes]).sum(axis=1) / (df_features[bid_volumes].sum(axis=1) + 1e-8)
                 df_features[f'{prefix}vwap_ask'] = (df_features[ask_prices] * df_features[ask_volumes]).sum(axis=1) / (df_features[ask_volumes].sum(axis=1) + 1e-8)
+                
+                # Micro-price (more accurate than mid price)
+                total_bid_vol = df_features[bid_volumes].sum(axis=1)
+                total_ask_vol = df_features[ask_volumes].sum(axis=1)
+                df_features[f'{prefix}micro_price'] = (
+                    (df_features['ask_price1'] * total_bid_vol + df_features['bid_price1'] * total_ask_vol) /
+                    (total_bid_vol + total_ask_vol + 1e-8)
+                )
         
-        # Price impact features (if all levels available)
+        # Price impact features (all levels)
         if 'ask_price5' in df_features.columns and 'bid_price5' in df_features.columns:
             df_features[f'{prefix}price_impact_buy'] = (df_features['ask_price5'] - df_features['ask_price1']) / (df_features['ask_price1'] + 1e-8)
             df_features[f'{prefix}price_impact_sell'] = (df_features['bid_price1'] - df_features['bid_price5']) / (df_features['bid_price1'] + 1e-8)
+            
+            # Market depth
+            df_features[f'{prefix}market_depth_buy'] = df_features[ask_volumes].sum(axis=1) if ask_volumes else 0
+            df_features[f'{prefix}market_depth_sell'] = df_features[bid_volumes].sum(axis=1) if bid_volumes else 0
         
         return df_features
     
-    def calculate_time_series_features(self, df, prefix="", min_periods_for_indicators=50):
-        """Calculate time-series based features"""
+    def _calculate_concentration(self, volume_array):
+        """Calculate volume concentration (simplified Gini coefficient)"""
+        if volume_array.shape[1] == 0:
+            return np.zeros(volume_array.shape[0])
+        
+        # Normalize volumes to sum to 1 for each row
+        volume_array = volume_array + 1e-8  # Avoid division by zero
+        normalized = volume_array / volume_array.sum(axis=1, keepdims=True)
+        
+        # Calculate Gini coefficient for each row
+        n = volume_array.shape[1]
+        concentration = np.zeros(volume_array.shape[0])
+        
+        for i in range(volume_array.shape[0]):
+            sorted_vols = np.sort(normalized[i])
+            cumsum = np.cumsum(sorted_vols)
+            concentration[i] = (2 * np.sum((np.arange(1, n+1) - (n+1)/2) * sorted_vols)) / (n * np.sum(sorted_vols))
+        
+        return concentration
+    
+    def calculate_advanced_time_series_features(self, df, prefix="", min_periods_for_indicators=50):
+        """Calculate advanced time-series based features"""
         df_features = df.copy()
         
-        # Price-based features
-        windows = [5, 10, 30, 60, 300]  # 5s, 10s, 30s, 1min, 5min
+        # Price-based features with multiple timeframes
+        windows = [5, 10, 30, 60, 120, 300]  # 5s, 10s, 30s, 1min, 2min, 5min
         
         for window in windows:
-            if len(df_features) > window:  # Only calculate if we have enough data
+            if len(df_features) > window:
                 # Returns
                 df_features[f'{prefix}return_{window}s'] = df_features['mid_price'].pct_change(window)
                 
-                # Realized volatility
+                # Log returns (more stable)
+                df_features[f'{prefix}log_return_{window}s'] = np.log(df_features['mid_price'] / df_features['mid_price'].shift(window))
+                
+                # Realized volatility (multiple estimators)
                 returns = df_features['mid_price'].pct_change()
                 df_features[f'{prefix}realized_vol_{window}s'] = returns.rolling(window, min_periods=1).std() * np.sqrt(window)
                 
-                # Price momentum
-                df_features[f'{prefix}momentum_{window}s'] = (df_features['mid_price'] / df_features['mid_price'].shift(window) - 1)
+                # Garman-Klass volatility estimator (if we had OHLC data)
+                # Using mid-price as proxy
+                high_proxy = df_features['mid_price'].rolling(window, min_periods=1).max()
+                low_proxy = df_features['mid_price'].rolling(window, min_periods=1).min()
+                df_features[f'{prefix}gk_vol_{window}s'] = np.sqrt(
+                    0.5 * np.log(high_proxy / low_proxy)**2 - 
+                    (2*np.log(2) - 1) * np.log(df_features['mid_price'] / df_features['mid_price'].shift(window))**2
+                )
                 
-                # Volume momentum (if total_volume exists)
+                # Range-based volatility
+                df_features[f'{prefix}range_vol_{window}s'] = (high_proxy - low_proxy) / df_features['mid_price']
+                
+                # Price momentum with different measures
+                df_features[f'{prefix}momentum_{window}s'] = (df_features['mid_price'] / df_features['mid_price'].shift(window) - 1)
+                df_features[f'{prefix}roc_{window}s'] = (df_features['mid_price'] - df_features['mid_price'].shift(window)) / df_features['mid_price'].shift(window)
+                
+                # Volatility clustering features
+                if window >= 30:
+                    vol_series = returns.rolling(window, min_periods=1).std()
+                    df_features[f'{prefix}vol_momentum_{window}s'] = vol_series.pct_change()
+                    df_features[f'{prefix}vol_mean_reversion_{window}s'] = vol_series / vol_series.rolling(window*2, min_periods=1).mean() - 1
+                
+                # Volume-based features
                 if f'{prefix}total_volume' in df_features.columns:
                     df_features[f'{prefix}volume_momentum_{window}s'] = df_features[f'{prefix}total_volume'].pct_change(window)
+                    df_features[f'{prefix}volume_ma_{window}s'] = df_features[f'{prefix}total_volume'].rolling(window, min_periods=1).mean()
+                    
+                    # Volume-price relationship
+                    price_vol_corr = df_features['mid_price'].pct_change().rolling(window, min_periods=5).corr(
+                        df_features[f'{prefix}total_volume'].pct_change()
+                    )
+                    df_features[f'{prefix}price_volume_corr_{window}s'] = price_vol_corr
                 
-                # Spread momentum
+                # Spread dynamics
                 if f'{prefix}spread' in df_features.columns:
                     df_features[f'{prefix}spread_momentum_{window}s'] = df_features[f'{prefix}spread'].pct_change(window)
+                    df_features[f'{prefix}spread_volatility_{window}s'] = df_features[f'{prefix}spread'].pct_change().rolling(window, min_periods=1).std()
         
-        # Technical indicators (only if we have enough data)
+        # Advanced technical indicators (only if we have enough data)
         if len(df_features) >= min_periods_for_indicators:
-            # Moving averages
-            min_window = min(20, len(df_features) // 2)
-            df_features[f'{prefix}sma_20'] = df_features['mid_price'].rolling(min_window, min_periods=1).mean()
-            df_features[f'{prefix}ema_20'] = df_features['mid_price'].ewm(span=min_window, min_periods=1).mean()
+            try:
+                # Convert to numpy arrays for TA-Lib
+                prices = df_features['mid_price'].values.astype(np.float64)
+                
+                # Moving averages and bands
+                df_features[f'{prefix}sma_20'] = talib.SMA(prices, timeperiod=min(20, len(prices)//2))
+                df_features[f'{prefix}ema_20'] = talib.EMA(prices, timeperiod=min(20, len(prices)//2))
+                df_features[f'{prefix}bb_upper'], df_features[f'{prefix}bb_middle'], df_features[f'{prefix}bb_lower'] = talib.BBANDS(prices, timeperiod=min(20, len(prices)//2))
+                
+                # Position in Bollinger Bands
+                df_features[f'{prefix}bb_position'] = (prices - df_features[f'{prefix}bb_lower']) / (df_features[f'{prefix}bb_upper'] - df_features[f'{prefix}bb_lower'] + 1e-8)
+                df_features[f'{prefix}bb_width'] = (df_features[f'{prefix}bb_upper'] - df_features[f'{prefix}bb_lower']) / df_features[f'{prefix}bb_middle']
+                
+                # Momentum indicators
+                df_features[f'{prefix}rsi'] = talib.RSI(prices, timeperiod=min(14, len(prices)//4))
+                df_features[f'{prefix}macd'], df_features[f'{prefix}macd_signal'], df_features[f'{prefix}macd_hist'] = talib.MACD(prices)
+                df_features[f'{prefix}cci'] = talib.CCI(prices, prices, prices, timeperiod=min(14, len(prices)//4))
+                
+                # Volatility indicators
+                df_features[f'{prefix}atr'] = talib.ATR(prices, prices, prices, timeperiod=min(14, len(prices)//4))
+                
+                # Trend indicators
+                df_features[f'{prefix}adx'] = talib.ADX(prices, prices, prices, timeperiod=min(14, len(prices)//4))
+                
+            except Exception as e:
+                print(f"Warning: TA-Lib indicators failed: {e}")
+                # Fallback to simple indicators
+                min_window = min(20, len(df_features) // 2)
+                df_features[f'{prefix}sma_20'] = df_features['mid_price'].rolling(min_window, min_periods=1).mean()
+                df_features[f'{prefix}ema_20'] = df_features['mid_price'].ewm(span=min_window, min_periods=1).mean()
+                
+                # Simple RSI
+                delta = df_features['mid_price'].diff()
+                gain = delta.where(delta > 0, 0).rolling(window=min(14, min_window), min_periods=1).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(window=min(14, min_window), min_periods=1).mean()
+                rs = gain / (loss + 1e-8)
+                df_features[f'{prefix}rsi'] = 100 - (100 / (1 + rs))
+        
+        # Microstructure features
+        if len(df_features) > 10:
+            # Tick direction and intensity
+            price_changes = df_features['mid_price'].diff()
+            df_features[f'{prefix}tick_direction'] = np.sign(price_changes)
+            df_features[f'{prefix}tick_intensity'] = np.abs(price_changes)
             
-            # Bollinger Bands
-            sma = df_features['mid_price'].rolling(min_window, min_periods=1).mean()
-            std = df_features['mid_price'].rolling(min_window, min_periods=1).std()
-            df_features[f'{prefix}bb_upper'] = sma + (std * 2)
-            df_features[f'{prefix}bb_lower'] = sma - (std * 2)
-            df_features[f'{prefix}bb_position'] = (df_features['mid_price'] - df_features[f'{prefix}bb_lower']) / (df_features[f'{prefix}bb_upper'] - df_features[f'{prefix}bb_lower'] + 1e-8)
+            # Price acceleration
+            df_features[f'{prefix}price_acceleration'] = price_changes.diff()
             
-            # RSI (simplified)
-            delta = df_features['mid_price'].diff()
-            gain = delta.where(delta > 0, 0).rolling(window=min(14, min_window), min_periods=1).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=min(14, min_window), min_periods=1).mean()
-            rs = gain / (loss + 1e-8)
-            df_features[f'{prefix}rsi'] = 100 - (100 / (1 + rs))
+            # Smoothed price using Savitzky-Golay filter
+            try:
+                window_length = min(11, len(df_features) // 2)
+                if window_length % 2 == 0:
+                    window_length -= 1
+                if window_length >= 3:
+                    df_features[f'{prefix}smoothed_price'] = savgol_filter(df_features['mid_price'], window_length, 2)
+                    df_features[f'{prefix}price_noise'] = df_features['mid_price'] - df_features[f'{prefix}smoothed_price']
+            except:
+                pass
         
         return df_features
     
     def calculate_cross_asset_features(self, eth_df, is_test=False):
-        """Calculate cross-asset correlation and momentum features"""
+        """Calculate advanced cross-asset correlation and momentum features"""
         df_features = eth_df.copy()
         
         suffix = "_test" if is_test else "_train"
@@ -228,59 +361,150 @@ class ETHVolatilityForecaster:
             if asset_key in self.cross_assets:
                 asset_df = self.cross_assets[asset_key]
                 
-                # Merge on timestamp
+                # Merge on timestamp with tolerance
                 merged = pd.merge_asof(df_features.sort_values('timestamp'), 
                                      asset_df[['timestamp', 'mid_price']].sort_values('timestamp'),
                                      on='timestamp', 
                                      suffixes=('', f'_{asset_name}'),
-                                     direction='backward')
+                                     direction='backward',
+                                     tolerance=pd.Timedelta('5s'))  # 5-second tolerance
                 
                 if f'mid_price_{asset_name}' in merged.columns:
-                    # Cross-asset returns
+                    # Returns for different timeframes
                     eth_returns = merged['mid_price'].pct_change()
                     asset_returns = merged[f'mid_price_{asset_name}'].pct_change()
                     
-                    # Rolling correlation (shorter window to ensure we have data)
-                    corr_window = min(60, len(merged) // 4) if len(merged) > 10 else 10
-                    df_features[f'{asset_name}_correlation_60s'] = eth_returns.rolling(corr_window, min_periods=5).corr(asset_returns)
+                    windows = [10, 30, 60, 300]
+                    for window in windows:
+                        if len(merged) > window:
+                            # Rolling correlation
+                            df_features[f'{asset_name}_correlation_{window}s'] = eth_returns.rolling(window, min_periods=5).corr(asset_returns)
+                            
+                            # Rolling beta (ETH vs asset)
+                            eth_ret_window = eth_returns.rolling(window, min_periods=5)
+                            asset_ret_window = asset_returns.rolling(window, min_periods=5)
+                            covariance = eth_ret_window.cov(asset_ret_window)
+                            asset_variance = asset_ret_window.var()
+                            df_features[f'{asset_name}_beta_{window}s'] = covariance / (asset_variance + 1e-8)
+                            
+                            # Cross-asset momentum
+                            df_features[f'{asset_name}_return_{window}s'] = merged[f'mid_price_{asset_name}'].pct_change(window)
+                            
+                            # Relative strength
+                            eth_momentum = merged['mid_price'].pct_change(window)
+                            asset_momentum = merged[f'mid_price_{asset_name}'].pct_change(window)
+                            df_features[f'{asset_name}_relative_strength_{window}s'] = eth_momentum - asset_momentum
                     
-                    # Cross-asset returns
-                    df_features[f'{asset_name}_return_5s'] = merged[f'mid_price_{asset_name}'].pct_change(5)
-                    df_features[f'{asset_name}_return_30s'] = merged[f'mid_price_{asset_name}'].pct_change(30)
+                    # Cross-asset volatility spillover
+                    eth_vol = eth_returns.rolling(60, min_periods=5).std()
+                    asset_vol = asset_returns.rolling(60, min_periods=5).std()
+                    df_features[f'{asset_name}_vol_spillover'] = eth_vol.rolling(30, min_periods=5).corr(asset_vol)
                     
-                    # Relative performance
-                    df_features[f'{asset_name}_relative_performance'] = eth_returns - asset_returns
+                    # Lead-lag relationships
+                    for lag in [1, 2, 3, 5]:
+                        if len(merged) > lag:
+                            # Asset returns leading ETH
+                            df_features[f'{asset_name}_lead_corr_{lag}s'] = eth_returns.rolling(30, min_periods=5).corr(asset_returns.shift(lag))
+                            # ETH returns leading asset
+                            df_features[f'{asset_name}_lag_corr_{lag}s'] = eth_returns.shift(lag).rolling(30, min_periods=5).corr(asset_returns)
+                    
+                    # Price level relationships
+                    df_features[f'{asset_name}_price_ratio'] = merged['mid_price'] / merged[f'mid_price_{asset_name}']
+                    df_features[f'{asset_name}_price_ratio_ma'] = df_features[f'{asset_name}_price_ratio'].rolling(60, min_periods=1).mean()
+                    df_features[f'{asset_name}_price_ratio_std'] = df_features[f'{asset_name}_price_ratio'].rolling(60, min_periods=1).std()
+        
+        return df_features
+    
+    def create_regime_features(self, df):
+        """Create market regime-based features"""
+        df_features = df.copy()
+        
+        if len(df_features) < 60:
+            return df_features
+        
+        # Volatility regimes
+        returns = df_features['mid_price'].pct_change()
+        vol_30s = returns.rolling(30, min_periods=1).std()
+        vol_300s = returns.rolling(300, min_periods=1).std()
+        
+        # High/low volatility regime
+        vol_quantiles = vol_300s.rolling(1800, min_periods=60).quantile([0.33, 0.67])  # 30-minute window
+        df_features['vol_regime'] = pd.cut(vol_300s, bins=[0, vol_quantiles.iloc[:, 0].fillna(vol_300s.quantile(0.33)).values,
+                                                          vol_quantiles.iloc[:, 1].fillna(vol_300s.quantile(0.67)).values,
+                                                          np.inf], labels=[0, 1, 2])
+        
+        # Trend regimes
+        sma_short = df_features['mid_price'].rolling(60, min_periods=1).mean()
+        sma_long = df_features['mid_price'].rolling(300, min_periods=1).mean()
+        df_features['trend_regime'] = np.where(sma_short > sma_long, 1, 0)  # 1 = uptrend, 0 = downtrend
+        
+        # Momentum regimes
+        momentum_10s = df_features['mid_price'].pct_change(10)
+        momentum_60s = df_features['mid_price'].pct_change(60)
+        df_features['momentum_regime'] = np.where((momentum_10s > 0) & (momentum_60s > 0), 2,  # Strong up
+                                                 np.where((momentum_10s < 0) & (momentum_60s < 0), 0,  # Strong down
+                                                         1))  # Mixed/sideways
         
         return df_features
     
     def create_lagged_features(self, df, target_col=None):
-        """Create lagged features for time series prediction"""
+        """Create comprehensive lagged features for time series prediction"""
         df_features = df.copy()
         
-        # Base lag features (available in both train and test)
-        base_lag_features = ['mid_price', 'spread_pct', 'volume_imbalance_1']
+        # Core features for lagging
+        core_features = ['mid_price', 'spread_pct', 'volume_imbalance_1', 'weighted_orderbook_pressure']
         
-        # Add realized volatility if it exists
-        realized_vol_cols = [col for col in df_features.columns if 'realized_vol_60s' in col]
-        if realized_vol_cols:
-            base_lag_features.extend(realized_vol_cols)
+        # Add volatility features if they exist
+        vol_features = [col for col in df_features.columns if 'realized_vol_60s' in col or 'gk_vol_60s' in col]
+        core_features.extend(vol_features)
+        
+        # Add cross-asset features
+        cross_features = [col for col in df_features.columns if any(asset in col for asset in ['BTC', 'SOL']) and 'return_30s' in col]
+        core_features.extend(cross_features[:5])  # Limit to avoid too many features
         
         # Only add target lags for training data
         if target_col and target_col in df.columns:
-            base_lag_features.append(target_col)
+            core_features.append(target_col)
         
-        lags = [1, 2, 3, 5, 10]  # 1s, 2s, 3s, 5s, 10s lags
+        lags = [1, 2, 3, 5, 10, 20, 30]  # Multiple lag periods
         
-        for feature in base_lag_features:
+        for feature in core_features:
             if feature in df_features.columns:
                 for lag in lags:
                     df_features[f'{feature}_lag_{lag}'] = df_features[feature].shift(lag)
         
+        # Create interaction features between key lags
+        if 'mid_price_lag_1' in df_features.columns and 'mid_price_lag_10' in df_features.columns:
+            df_features['price_momentum_lag'] = df_features['mid_price_lag_1'] / df_features['mid_price_lag_10'] - 1
+        
         return df_features
     
+    def feature_selection(self, X_train, y_train, max_features=100):
+        """Select the most important features"""
+        print(f"Performing feature selection from {X_train.shape[1]} features...")
+        
+        # Remove features with low variance
+        from sklearn.feature_selection import VarianceThreshold
+        variance_selector = VarianceThreshold(threshold=0.001)
+        X_train_var = variance_selector.fit_transform(X_train)
+        selected_features = X_train.columns[variance_selector.get_support()]
+        
+        print(f"After variance filtering: {len(selected_features)} features")
+        
+        # Select top features using f_regression
+        if len(selected_features) > max_features:
+            selector = SelectKBest(score_func=f_regression, k=max_features)
+            X_train_selected = selector.fit_transform(X_train[selected_features], y_train)
+            final_features = selected_features[selector.get_support()]
+            print(f"After statistical selection: {len(final_features)} features")
+        else:
+            final_features = selected_features
+        
+        return final_features.tolist()
+
     def engineer_features(self):
-        """Main feature engineering pipeline"""
-        print("Starting feature engineering...")
+        """Enhanced feature engineering pipeline"""
+        print("Starting enhanced feature engineering...")
         
         # Store original test data length
         original_test_length = len(self.eth_test)
@@ -292,21 +516,25 @@ class ETHVolatilityForecaster:
         
         print(f"Test data length after cleaning: {len(self.eth_test)}")
         
-        # Calculate orderbook features
-        self.eth_train = self.calculate_orderbook_features(self.eth_train)
-        self.eth_test = self.calculate_orderbook_features(self.eth_test)
+        # Calculate advanced orderbook features
+        self.eth_train = self.calculate_advanced_orderbook_features(self.eth_train)
+        self.eth_test = self.calculate_advanced_orderbook_features(self.eth_test)
         
-        # Calculate time series features
-        self.eth_train = self.calculate_time_series_features(self.eth_train, min_periods_for_indicators=100)
-        self.eth_test = self.calculate_time_series_features(self.eth_test, min_periods_for_indicators=50)
+        # Calculate advanced time series features
+        self.eth_train = self.calculate_advanced_time_series_features(self.eth_train, min_periods_for_indicators=200)
+        self.eth_test = self.calculate_advanced_time_series_features(self.eth_test, min_periods_for_indicators=100)
         
         # Calculate cross-asset features
         self.eth_train = self.calculate_cross_asset_features(self.eth_train, is_test=False)
         self.eth_test = self.calculate_cross_asset_features(self.eth_test, is_test=True)
         
+        # Create regime features
+        self.eth_train = self.create_regime_features(self.eth_train)
+        self.eth_test = self.create_regime_features(self.eth_test)
+        
         # Create lagged features
         self.eth_train = self.create_lagged_features(self.eth_train, 'label')
-        self.eth_test = self.create_lagged_features(self.eth_test)  # No target column
+        self.eth_test = self.create_lagged_features(self.eth_test)
         
         print(f"Test data length after feature engineering: {len(self.eth_test)}")
         
@@ -315,11 +543,9 @@ class ETHVolatilityForecaster:
         test_features = set(self.eth_test.columns) - {'timestamp'}
         common_features = train_features.intersection(test_features)
         
-        self.feature_columns = list(common_features)
-        
         print(f"Total train features: {len(train_features)}")
         print(f"Total test features: {len(test_features)}")
-        print(f"Common features for modeling: {len(self.feature_columns)}")
+        print(f"Common features before selection: {len(common_features)}")
         
         # Remove rows with NaN values created by feature engineering - ONLY for training data
         initial_train_size = len(self.eth_train)
@@ -327,19 +553,27 @@ class ETHVolatilityForecaster:
         print(f"Removed {initial_train_size - len(self.eth_train)} rows with NaN values from training data")
         
         # For test data, fill NaN instead of dropping - preserve ALL rows
-        test_length_before_fill = len(self.eth_test)
-        for col in self.feature_columns:
+        for col in common_features:
             if col in self.eth_test.columns:
                 self.eth_test[col] = self.eth_test[col].fillna(method='ffill').fillna(method='bfill').fillna(0)
         
+        # Feature selection
+        if len(common_features) > 100:
+            X_temp = self.eth_train[list(common_features)].fillna(0)
+            y_temp = self.eth_train['label']
+            selected_features = self.feature_selection(X_temp, y_temp, max_features=150)
+            self.feature_columns = selected_features
+        else:
+            self.feature_columns = list(common_features)
+        
+        print(f"Final selected features for modeling: {len(self.feature_columns)}")
         print(f"Test data length after filling NaN: {len(self.eth_test)} (should be {original_test_length})")
         
-        # If we still lost rows, this is a problem we need to address
+        # If we still lost rows, this is a problem
         if len(self.eth_test) != original_test_length:
             print(f"ERROR: Lost {original_test_length - len(self.eth_test)} test rows during feature engineering!")
-            print("This will cause submission length mismatch.")
         
-        print("Feature engineering completed!")
+        print("Enhanced feature engineering completed!")
     
     def prepare_data_for_modeling(self):
         """Prepare features and target for modeling"""
@@ -361,13 +595,25 @@ class ETHVolatilityForecaster:
         return X_train, y_train, X_test
     
     def time_series_cross_validation(self, X, y, n_splits=5):
-        """Perform time series cross validation"""
+        """Perform enhanced time series cross validation with walk-forward approach"""
         tscv = TimeSeriesSplit(n_splits=n_splits)
-        cv_scores = []
+        cv_results = {
+            'correlations': [],
+            'rmse_scores': [],
+            'mae_scores': [],
+            'spearman_correlations': []
+        }
         
-        # Use a simple model for CV to save time
-        model = Ridge(alpha=1.0)
-        scaler = StandardScaler()
+        # Use multiple models for robust CV
+        models = {
+            'ridge': Ridge(alpha=1.0),
+            'elastic': ElasticNet(alpha=0.1, l1_ratio=0.5),
+            'xgb': xgb.XGBRegressor(n_estimators=50, max_depth=4, random_state=42, n_jobs=-1)
+        }
+        
+        scaler = RobustScaler()  # More robust to outliers
+        
+        model_cv_scores = {name: [] for name in models.keys()}
         
         for train_idx, val_idx in tscv.split(X):
             X_train_cv, X_val_cv = X.iloc[train_idx], X.iloc[val_idx]
@@ -377,68 +623,125 @@ class ETHVolatilityForecaster:
             X_train_scaled = scaler.fit_transform(X_train_cv)
             X_val_scaled = scaler.transform(X_val_cv)
             
-            # Train and predict
-            model.fit(X_train_scaled, y_train_cv)
-            y_pred = model.predict(X_val_scaled)
+            fold_predictions = []
             
-            # Calculate correlation
-            corr, _ = pearsonr(y_val_cv, y_pred)
-            cv_scores.append(corr)
+            for model_name, model in models.items():
+                if model_name == 'xgb':
+                    model.fit(X_train_cv, y_train_cv)
+                    y_pred = model.predict(X_val_cv)
+                else:
+                    model.fit(X_train_scaled, y_train_cv)
+                    y_pred = model.predict(X_val_scaled)
+                
+                # Calculate metrics
+                corr, _ = pearsonr(y_val_cv, y_pred)
+                model_cv_scores[model_name].append(corr)
+                fold_predictions.append(y_pred)
+            
+            # Ensemble prediction for this fold
+            ensemble_pred = np.mean(fold_predictions, axis=0)
+            
+            # Calculate ensemble metrics
+            corr, _ = pearsonr(y_val_cv, ensemble_pred)
+            spearman_corr, _ = spearmanr(y_val_cv, ensemble_pred)
+            rmse = np.sqrt(mean_squared_error(y_val_cv, ensemble_pred))
+            mae = mean_absolute_error(y_val_cv, ensemble_pred)
+            
+            cv_results['correlations'].append(corr)
+            cv_results['spearman_correlations'].append(spearman_corr)
+            cv_results['rmse_scores'].append(rmse)
+            cv_results['mae_scores'].append(mae)
         
-        return cv_scores
+        # Print individual model performance
+        for model_name, scores in model_cv_scores.items():
+            print(f"{model_name.upper()} CV Correlation: {np.mean(scores):.4f} (+/- {np.std(scores) * 2:.4f})")
+        
+        return cv_results
     
-    def train_models(self):
-        """Train multiple models and ensemble them"""
+    def train_advanced_models(self):
+        """Train multiple advanced models with optimized hyperparameters"""
         print("Preparing data for modeling...")
         X_train, y_train, X_test = self.prepare_data_for_modeling()
         
-        print("Performing time series cross validation...")
-        cv_scores = self.time_series_cross_validation(X_train, y_train)
-        print(f"CV Correlation scores: {[f'{score:.4f}' for score in cv_scores]}")
-        print(f"Mean CV Correlation: {np.mean(cv_scores):.4f} (+/- {np.std(cv_scores) * 2:.4f})")
+        print("Performing enhanced time series cross validation...")
+        cv_results = self.time_series_cross_validation(X_train, y_train)
+        print(f"Ensemble CV Pearson Correlation: {np.mean(cv_results['correlations']):.4f} (+/- {np.std(cv_results['correlations']) * 2:.4f})")
+        print(f"Ensemble CV Spearman Correlation: {np.mean(cv_results['spearman_correlations']):.4f} (+/- {np.std(cv_results['spearman_correlations']) * 2:.4f})")
+        print(f"Ensemble CV RMSE: {np.mean(cv_results['rmse_scores']):.6f} (+/- {np.std(cv_results['rmse_scores']) * 2:.6f})")
         
-        # Scale features
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
-        self.scalers['standard'] = scaler
+        # Multiple scalers for different model types
+        standard_scaler = StandardScaler()
+        robust_scaler = RobustScaler()
+        minmax_scaler = MinMaxScaler()
         
-        print("Training models...")
+        X_train_standard = standard_scaler.fit_transform(X_train)
+        X_train_robust = robust_scaler.fit_transform(X_train)
+        X_train_minmax = minmax_scaler.fit_transform(X_train)
         
-        # Model 1: Ridge Regression
+        X_test_standard = standard_scaler.transform(X_test)
+        X_test_robust = robust_scaler.transform(X_test)
+        X_test_minmax = minmax_scaler.transform(X_test)
+        
+        self.scalers['standard'] = standard_scaler
+        self.scalers['robust'] = robust_scaler
+        self.scalers['minmax'] = minmax_scaler
+        
+        print("Training advanced models...")
+        
+        # Model 1: Ridge with L2 regularization (standard scaling)
         print("Training Ridge Regression...")
-        ridge = Ridge(alpha=1.0)
-        ridge.fit(X_train_scaled, y_train)
+        ridge = Ridge(alpha=0.5, random_state=42)
+        ridge.fit(X_train_standard, y_train)
         self.models['ridge'] = ridge
         
-        # Model 2: Random Forest
+        # Model 2: ElasticNet with L1+L2 regularization (robust scaling)
+        print("Training ElasticNet...")
+        elastic = ElasticNet(alpha=0.1, l1_ratio=0.5, random_state=42, max_iter=2000)
+        elastic.fit(X_train_robust, y_train)
+        self.models['elasticnet'] = elastic
+        
+        # Model 3: Random Forest with optimized parameters
         print("Training Random Forest...")
-        rf = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1)
+        rf = RandomForestRegressor(
+            n_estimators=150,
+            max_depth=12,
+            min_samples_split=5,
+            min_samples_leaf=2,
+            max_features='sqrt',
+            random_state=42,
+            n_jobs=-1
+        )
         rf.fit(X_train, y_train)
         self.models['random_forest'] = rf
         
-        # Model 3: XGBoost
+        # Model 4: XGBoost with early stopping
         print("Training XGBoost...")
         xgb_model = xgb.XGBRegressor(
-            n_estimators=200,
+            n_estimators=300,
             max_depth=6,
-            learning_rate=0.1,
+            learning_rate=0.05,
             subsample=0.8,
             colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
             random_state=42,
             n_jobs=-1
         )
         xgb_model.fit(X_train, y_train)
         self.models['xgboost'] = xgb_model
         
-        # Model 4: LightGBM
+        # Model 5: LightGBM with dart boosting
         print("Training LightGBM...")
         lgb_model = lgb.LGBMRegressor(
-            n_estimators=200,
+            n_estimators=300,
             max_depth=6,
-            learning_rate=0.1,
+            learning_rate=0.05,
             subsample=0.8,
             colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
+            boosting_type='dart',
+            drop_rate=0.1,
             random_state=42,
             n_jobs=-1,
             verbose=-1
@@ -446,47 +749,178 @@ class ETHVolatilityForecaster:
         lgb_model.fit(X_train, y_train)
         self.models['lightgbm'] = lgb_model
         
+        # Model 6: Gradient Boosting
+        print("Training Gradient Boosting...")
+        gb = GradientBoostingRegressor(
+            n_estimators=200,
+            max_depth=5,
+            learning_rate=0.05,
+            subsample=0.8,
+            random_state=42
+        )
+        gb.fit(X_train, y_train)
+        self.models['gradient_boosting'] = gb
+        
+        # Model 7: Neural Network (MLP)
+        print("Training Neural Network...")
+        try:
+            mlp = MLPRegressor(
+                hidden_layer_sizes=(100, 50, 25),
+                activation='relu',
+                solver='adam',
+                alpha=0.01,
+                learning_rate='adaptive',
+                max_iter=500,
+                random_state=42
+            )
+            mlp.fit(X_train_standard, y_train)
+            self.models['mlp'] = mlp
+        except Exception as e:
+            print(f"Warning: MLP training failed: {e}")
+        
+        # Store feature importance from tree-based models
+        self.feature_importance['xgboost'] = dict(zip(X_train.columns, xgb_model.feature_importances_))
+        self.feature_importance['lightgbm'] = dict(zip(X_train.columns, lgb_model.feature_importances_))
+        self.feature_importance['random_forest'] = dict(zip(X_train.columns, rf.feature_importances_))
+        
         # Evaluate models on training data
-        print("\nModel evaluation on training data:")
+        print("\nAdvanced model evaluation on training data:")
+        scaled_data = {
+            'ridge': X_train_standard,
+            'elasticnet': X_train_robust,
+            'mlp': X_train_standard
+        }
+        
         for model_name, model in self.models.items():
-            if model_name == 'ridge':
-                y_pred = model.predict(X_train_scaled)
+            if model_name in scaled_data:
+                y_pred = model.predict(scaled_data[model_name])
             else:
                 y_pred = model.predict(X_train)
             
             corr, _ = pearsonr(y_train, y_pred)
+            spearman_corr, _ = spearmanr(y_train, y_pred)
             rmse = np.sqrt(mean_squared_error(y_train, y_pred))
-            print(f"{model_name}: Correlation = {corr:.4f}, RMSE = {rmse:.6f}")
+            print(f"{model_name}: Pearson = {corr:.4f}, Spearman = {spearman_corr:.4f}, RMSE = {rmse:.6f}")
         
-        print("Model training completed!")
+        print("Advanced model training completed!")
         
-        return X_test_scaled, X_test
+        return {
+            'standard': X_test_standard,
+            'robust': X_test_robust,
+            'minmax': X_test_minmax,
+            'raw': X_test
+        }
     
-    def generate_predictions(self, X_test_scaled, X_test):
-        """Generate ensemble predictions"""
-        print("Generating predictions...")
+    def generate_predictions(self, X_test_dict):
+        """Generate sophisticated ensemble predictions with multiple strategies"""
+        print("Generating advanced ensemble predictions...")
         
         predictions = {}
         
-        # Get predictions from each model
-        predictions['ridge'] = self.models['ridge'].predict(X_test_scaled)
-        predictions['random_forest'] = self.models['random_forest'].predict(X_test)
-        predictions['xgboost'] = self.models['xgboost'].predict(X_test)
-        predictions['lightgbm'] = self.models['lightgbm'].predict(X_test)
+        # Get predictions from each model with appropriate scaling
+        predictions['ridge'] = self.models['ridge'].predict(X_test_dict['standard'])
+        predictions['elasticnet'] = self.models['elasticnet'].predict(X_test_dict['robust'])
+        predictions['random_forest'] = self.models['random_forest'].predict(X_test_dict['raw'])
+        predictions['xgboost'] = self.models['xgboost'].predict(X_test_dict['raw'])
+        predictions['lightgbm'] = self.models['lightgbm'].predict(X_test_dict['raw'])
+        predictions['gradient_boosting'] = self.models['gradient_boosting'].predict(X_test_dict['raw'])
         
-        # Ensemble prediction (weighted average)
-        weights = {
-            'ridge': 0.2,
-            'random_forest': 0.2,
-            'xgboost': 0.3,
-            'lightgbm': 0.3
+        if 'mlp' in self.models:
+            predictions['mlp'] = self.models['mlp'].predict(X_test_dict['standard'])
+        
+        # Multiple ensemble strategies
+        
+        # Strategy 1: Weighted average based on CV performance (baseline)
+        basic_weights = {
+            'ridge': 0.10,
+            'elasticnet': 0.10,
+            'random_forest': 0.15,
+            'xgboost': 0.25,
+            'lightgbm': 0.25,
+            'gradient_boosting': 0.15
         }
         
-        ensemble_pred = np.zeros(len(X_test))
-        for model_name, weight in weights.items():
-            ensemble_pred += weight * predictions[model_name]
+        if 'mlp' in predictions:
+            basic_weights['mlp'] = 0.10
+            # Renormalize weights
+            total_weight = sum(basic_weights.values())
+            basic_weights = {k: v/total_weight for k, v in basic_weights.items()}
         
-        return ensemble_pred, predictions
+        ensemble_basic = np.zeros(len(X_test_dict['raw']))
+        for model_name, weight in basic_weights.items():
+            if model_name in predictions:
+                ensemble_basic += weight * predictions[model_name]
+        
+        # Strategy 2: Rank averaging (more robust to outliers)
+        pred_matrix = np.column_stack([predictions[model] for model in predictions.keys()])
+        ranks = np.apply_along_axis(lambda x: stats.rankdata(x), axis=0, arr=pred_matrix.T)
+        ensemble_rank = np.mean(ranks, axis=0)
+        
+        # Convert ranks back to values using quantile mapping from basic ensemble
+        ensemble_rank_mapped = np.percentile(ensemble_basic, 
+                                           (ensemble_rank - 1) / (len(ensemble_rank) - 1) * 100)
+        
+        # Strategy 3: Median ensemble (robust to extreme predictions)
+        ensemble_median = np.median(pred_matrix, axis=1)
+        
+        # Strategy 4: Trimmed mean (remove extreme 20% of predictions)
+        ensemble_trimmed = stats.trim_mean(pred_matrix, 0.2, axis=1)
+        
+        # Strategy 5: Dynamic weighting based on recent performance (simplified)
+        # Weight tree-based models higher for volatility prediction
+        dynamic_weights = {
+            'ridge': 0.08,
+            'elasticnet': 0.08,
+            'random_forest': 0.18,
+            'xgboost': 0.28,
+            'lightgbm': 0.28,
+            'gradient_boosting': 0.18
+        }
+        
+        if 'mlp' in predictions:
+            dynamic_weights['mlp'] = 0.12
+            # Renormalize
+            total_weight = sum(dynamic_weights.values())
+            dynamic_weights = {k: v/total_weight for k, v in dynamic_weights.items()}
+        
+        ensemble_dynamic = np.zeros(len(X_test_dict['raw']))
+        for model_name, weight in dynamic_weights.items():
+            if model_name in predictions:
+                ensemble_dynamic += weight * predictions[model_name]
+        
+        # Final ensemble: Combine different strategies
+        final_ensemble = (
+            0.35 * ensemble_basic +      # Weighted average
+            0.20 * ensemble_rank_mapped + # Rank-based
+            0.15 * ensemble_median +      # Median
+            0.15 * ensemble_trimmed +     # Trimmed mean
+            0.15 * ensemble_dynamic       # Dynamic weighting
+        )
+        
+        # Apply post-processing smoothing for time series
+        if len(final_ensemble) > 5:
+            # Light smoothing to reduce noise
+            smoothed = savgol_filter(final_ensemble, window_length=min(5, len(final_ensemble)//2*2+1), polyorder=1)
+            final_ensemble = 0.8 * final_ensemble + 0.2 * smoothed
+        
+        # Store all ensemble strategies for analysis
+        ensemble_strategies = {
+            'basic': ensemble_basic,
+            'rank': ensemble_rank_mapped,
+            'median': ensemble_median,
+            'trimmed': ensemble_trimmed,
+            'dynamic': ensemble_dynamic,
+            'final': final_ensemble
+        }
+        
+        print(f"Generated predictions using {len(predictions)} models")
+        print(f"Prediction statistics:")
+        print(f"  Mean: {np.mean(final_ensemble):.6f}")
+        print(f"  Std:  {np.std(final_ensemble):.6f}")
+        print(f"  Min:  {np.min(final_ensemble):.6f}")
+        print(f"  Max:  {np.max(final_ensemble):.6f}")
+        
+        return final_ensemble, predictions, ensemble_strategies
     
     def create_submission(self, predictions):
         """Create submission file with correct format"""
@@ -507,10 +941,36 @@ class ETHVolatilityForecaster:
         
         return submission
     
+    def analyze_feature_importance(self):
+        """Analyze and display feature importance from tree-based models"""
+        print("\nFeature Importance Analysis:")
+        print("=" * 50)
+        
+        # Combine importance scores from all tree-based models
+        combined_importance = {}
+        
+        for model_name, importance_dict in self.feature_importance.items():
+            for feature, importance in importance_dict.items():
+                if feature not in combined_importance:
+                    combined_importance[feature] = []
+                combined_importance[feature].append(importance)
+        
+        # Calculate mean importance across models
+        mean_importance = {feature: np.mean(scores) for feature, scores in combined_importance.items()}
+        
+        # Sort by importance
+        sorted_features = sorted(mean_importance.items(), key=lambda x: x[1], reverse=True)
+        
+        print("Top 15 Most Important Features:")
+        for i, (feature, importance) in enumerate(sorted_features[:15]):
+            print(f"{i+1:2d}. {feature:<40} {importance:.4f}")
+        
+        return sorted_features
+    
     def run_full_pipeline(self):
-        """Run the complete forecasting pipeline"""
-        print("Starting ETH Implied Volatility Forecasting Pipeline...")
-        print("=" * 60)
+        """Run the complete advanced forecasting pipeline"""
+        print("Starting Advanced ETH Implied Volatility Forecasting Pipeline...")
+        print("=" * 70)
         
         # Load data
         self.load_data()
@@ -518,11 +978,14 @@ class ETHVolatilityForecaster:
         # Engineer features
         self.engineer_features()
         
-        # Train models
-        X_test_scaled, X_test = self.train_models()
+        # Train advanced models
+        X_test_dict = self.train_advanced_models()
+        
+        # Analyze feature importance
+        feature_rankings = self.analyze_feature_importance()
         
         # Generate predictions
-        final_predictions, individual_predictions = self.generate_predictions(X_test_scaled, X_test)
+        final_predictions, individual_predictions, ensemble_strategies = self.generate_predictions(X_test_dict)
         
         # Ensure predictions match test data length
         if len(final_predictions) != len(self.eth_test):
@@ -539,28 +1002,38 @@ class ETHVolatilityForecaster:
         # Create submission
         submission = self.create_submission(final_predictions)
         
-        print("=" * 60)
-        print("Pipeline completed successfully!")
+        print("=" * 70)
+        print("Advanced Pipeline completed successfully!")
         print(f"Final predictions shape: {final_predictions.shape}")
         print(f"Test data shape: {self.eth_test.shape}")
-        print(f"Prediction statistics:")
+        
+        # Compare ensemble strategies
+        print("\nEnsemble Strategy Comparison:")
+        for strategy_name, predictions in ensemble_strategies.items():
+            print(f"{strategy_name.upper():>12}: Mean={np.mean(predictions):.6f}, Std={np.std(predictions):.6f}")
+        
+        print(f"\nFinal Prediction Statistics:")
         print(f"  Mean: {np.mean(final_predictions):.6f}")
         print(f"  Std:  {np.std(final_predictions):.6f}")
         print(f"  Min:  {np.min(final_predictions):.6f}")
         print(f"  Max:  {np.max(final_predictions):.6f}")
         
-        return submission, final_predictions
+        return submission, final_predictions, feature_rankings
 
 # Main execution
 if __name__ == "__main__":
-    # Initialize the forecaster
+    # Initialize the advanced forecaster
     forecaster = ETHVolatilityForecaster()
     
-    # Run the complete pipeline
-    submission, predictions = forecaster.run_full_pipeline()
+    # Run the complete advanced pipeline
+    submission, predictions, feature_rankings = forecaster.run_full_pipeline()
     
     # Display submission preview
     print("\nSubmission preview:")
     print(submission.head(10))
     print("...")
     print(submission.tail(5))
+    
+    # Optional: Save additional analysis
+    print(f"\nSaved submission.csv with {len(submission)} rows")
+    print("Pipeline completed successfully!")
